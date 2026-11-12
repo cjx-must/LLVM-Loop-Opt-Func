@@ -1,0 +1,99 @@
+diff --git a/llvm/lib/Passes/PassRegistry.def b/llvm/lib/Passes/PassRegistry.def
+index 0eb050c8adb0..3282b993f1a0 100644
+--- a/llvm/lib/Passes/PassRegistry.def
++++ b/llvm/lib/Passes/PassRegistry.def
+@@ -705,4 +705,18 @@ LOOP_PASS_WITH_PARAMS(
+       return SimpleLoopUnswitchPass(Params.first, Params.second);
+     },
+     parseLoopUnswitchOptions, "nontrivial;no-nontrivial;trivial;no-trivial")
++LOOP_PASS_WITH_PARAMS(
++    "eslu", "NewExtraSimpleLoopUnswitchPass",
++    [](std::pair<bool, bool> Params) {
++        ExtraLoopPassManager<ShouldRunExtraSimpleLoopUnswitch> ExtraPasses;
++        ExtraPasses.addPass(SimpleLoopUnswitchPass(Params.first, Params.second));
++        return std::move(ExtraPasses);
++    },
++    parseLoopUnswitchOptions, "nontrivial;no-nontrivial;trivial;no-trivial")
++LOOP_PASS_WITH_PARAMS(
++    "luf", "NewLoopFullUnrollPass",
++    [](LoopUnrollOptions Params) { 
++        return LoopFullUnrollPass(Params.OptLevel);   
++    },
++    parseLoopUnrollOptions, "O0;O1;O2;O3")
+ #undef LOOP_PASS_WITH_PARAMS
+diff --git a/llvm/lib/Transforms/Scalar/LoopStrengthReduce.cpp b/llvm/lib/Transforms/Scalar/LoopStrengthReduce.cpp
+index 2c3d64b0e07d..55c060fd2a4f 100644
+--- a/llvm/lib/Transforms/Scalar/LoopStrengthReduce.cpp
++++ b/llvm/lib/Transforms/Scalar/LoopStrengthReduce.cpp
+@@ -53,6 +53,7 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "llvm/Transforms/Scalar/LoopStrengthReduce.h"
++#include "llvm/Transforms/Utils/LoopUtils.h"
+ #include "llvm/ADT/APInt.h"
+ #include "llvm/ADT/DenseMap.h"
+ #include "llvm/ADT/DenseSet.h"
+@@ -7161,7 +7162,10 @@ bool LoopStrengthReduce::runOnLoop(Loop *L, LPPassManager & /*LPM*/) {
+   MemorySSA *MSSA = nullptr;
+   if (MSSAAnalysis)
+     MSSA = &MSSAAnalysis->getMSSA();
+-  return ReduceLoopStrength(L, IU, SE, DT, LI, TTI, AC, TLI, MSSA);
++  bool Changed = ReduceLoopStrength(L, IU, SE, DT, LI, TTI, AC, TLI, MSSA);
++  for (const auto &LInFunc : LI)
++    Changed |= llvm::formLCSSARecursively(*LInFunc, DT, &LI, &SE); 
++  return Changed;
+ }
+ 
+ PreservedAnalyses LoopStrengthReducePass::run(Loop &L, LoopAnalysisManager &AM,
+@@ -7171,6 +7175,9 @@ PreservedAnalyses LoopStrengthReducePass::run(Loop &L, LoopAnalysisManager &AM,
+                           AR.DT, AR.LI, AR.TTI, AR.AC, AR.TLI, AR.MSSA))
+     return PreservedAnalyses::all();
+ 
++  for (const auto &LInFunc : AR.LI)
++    llvm::formLCSSARecursively(*LInFunc, AR.DT, &AR.LI, &AR.SE); 
++
+   auto PA = getLoopPassPreservedAnalyses();
+   if (AR.MSSA)
+     PA.preserve<MemorySSAAnalysis>();
+diff --git a/llvm/lib/Transforms/Utils/BasicBlockUtils.cpp b/llvm/lib/Transforms/Utils/BasicBlockUtils.cpp
+index f81420460f08..7d7fc41bc3db 100644
+--- a/llvm/lib/Transforms/Utils/BasicBlockUtils.cpp
++++ b/llvm/lib/Transforms/Utils/BasicBlockUtils.cpp
+@@ -1665,7 +1665,7 @@ void llvm::SplitBlockAndInsertIfThenElse(
+   }
+ 
+   LLVMContext &C = Head->getContext();
+-  BasicBlock *Tail = Head->splitBasicBlock(SplitBefore);
++  BasicBlock *Tail = Head->splitBasicBlock(SplitBefore, Head->getName() + ".splittail");
+   BasicBlock *TrueBlock = Tail;
+   BasicBlock *FalseBlock = Tail;
+   bool ThenToTailEdge = false;
+@@ -1673,7 +1673,7 @@ void llvm::SplitBlockAndInsertIfThenElse(
+ 
+   // Encapsulate the logic around creation/insertion/etc of a new block.
+   auto handleBlock = [&](BasicBlock **PBB, bool Unreachable, BasicBlock *&BB,
+-                         bool &ToTailEdge) {
++                         bool &ToTailEdge, const Twine &BBName) {
+     if (PBB == nullptr)
+       return; // Do not create/insert a block.
+ 
+@@ -1681,7 +1681,7 @@ void llvm::SplitBlockAndInsertIfThenElse(
+       BB = *PBB; // Caller supplied block, use it.
+     else {
+       // Create a new block.
+-      BB = BasicBlock::Create(C, "", Head->getParent(), Tail);
++      BB = BasicBlock::Create(C, BBName, Head->getParent(), Tail);
+       if (Unreachable)
+         (void)new UnreachableInst(C, BB);
+       else {
+@@ -1694,8 +1694,8 @@ void llvm::SplitBlockAndInsertIfThenElse(
+     }
+   };
+ 
+-  handleBlock(ThenBlock, UnreachableThen, TrueBlock, ThenToTailEdge);
+-  handleBlock(ElseBlock, UnreachableElse, FalseBlock, ElseToTailEdge);
++  handleBlock(ThenBlock, UnreachableThen, TrueBlock, ThenToTailEdge, Head->getName() + ".splitthen");
++  handleBlock(ElseBlock, UnreachableElse, FalseBlock, ElseToTailEdge, Head->getName() + ".splitelse");
+ 
+   Instruction *HeadOldTerm = Head->getTerminator();
+   BranchInst *HeadNewTerm =
